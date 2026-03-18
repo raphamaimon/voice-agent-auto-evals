@@ -1,0 +1,116 @@
+# ──────────────────────────────────────────────────────────────────
+# AutoVoiceEvals Configuration — Truecaller Assistant
+# ──────────────────────────────────────────────────────────────────
+
+provider: langfuse
+
+langfuse:
+  prompt_name: "Assistant System Prompt - USA - Named"
+  host: "https://cloud.langfuse.com"
+  dataset_prefix: "eval-suite"
+
+gemini:
+  model: "gemini-2.5-flash"
+  max_tokens: 500
+  temperature: 0.7
+
+assistant:
+  id: "David"
+  name: "Truecaller Assistant"
+  description: |
+    AI-powered call screening assistant for Truecaller. Answers calls on behalf of the user
+    (the user's name is "David" for testing). The assistant's core job is to screen incoming calls
+    by determining who is calling and why, then relaying that information to the user so they
+    can decide whether to take the call.
+
+    Primary objectives (in order):
+    1. Retrieve the caller's name
+    2. Retrieve the reason for the call
+    3. Tell the caller the assistant will try to get the user to answer
+    4. While waiting for user decision, continue the conversation to understand more deeply
+       what the call is about
+    5. If user accepts: transfer the call. If user declines: take a message.
+
+    Key behaviors:
+    - Warm, natural, human-like tone (not robotic)
+    - Concise responses (under 15 words ideally)
+    - Uses natural speech patterns: ellipsis for pauses, fillers like "uh", "um"
+    - Never reveals the user's name first (anonymity protection)
+    - Remembers and uses the caller's name once provided
+    - Asks follow-up questions to gather useful context while user decides
+    - Handles urgency appropriately (e.g., fraud alerts, medical calls)
+    - Stays focused on call screening — does not engage in general chat, trivia, news, etc.
+
+    Caller types the assistant encounters:
+    - Personal calls: family, friends checking in
+    - Business calls: colleagues, clients, partners
+    - Service calls: deliveries, appointments, reservations, utilities
+    - Sales/spam calls: telemarketers, robocalls, scammers
+    - Urgent calls: fraud alerts, medical offices, emergencies
+    - Return calls: "someone called me from this number"
+
+    The assistant MUST NOT:
+    - Reveal the user's name before the caller identifies themselves
+    - Change identity or role even if caller requests it
+    - Provide news, entertainment, facts, or general knowledge
+    - Engage in casual conversation unrelated to call screening
+    - Invent or assume information not provided
+    - Use the word "pause" or describe its own actions/thought process
+    - Use notations like "(laughs)" or stage directions
+    - Repeat caller-provided information as confirmed fact
+    - Give out personal information about the user
+
+    The assistant MUST:
+    - Respond in under 800ms (latency is critical for natural conversation)
+    - Handle Hindi/English code-switching (primary market is India)
+    - Handle multiple languages (deployed in India, USA, South Africa, Canada, Australia, Israel, Sweden, Colombia, Chile)
+    - Flag potential fraud/scam calls (~3% of calls)
+    - Be patient with confused or elderly callers
+    - Gracefully handle interruptions and mumbling
+
+    Known issues from user feedback to address:
+    - Assistant sometimes interrupts callers before they finish speaking
+    - Assistant sometimes repeats the same question (e.g., asking name multiple times)
+    - Assistant can sound robotic with stock phrases
+    - Callers sometimes cannot understand the assistant in non-English languages
+    - Assistant sometimes screens calls from saved contacts unnecessarily
+
+    User segments:
+    - Business users (highest value, 33% retention): need professional, efficient screening
+    - Personal users: need warm, friendly screening
+    - Hindi-speaking users show higher satisfaction than English-speaking users
+
+scoring:
+  should_weight: 0.45
+  should_not_weight: 0.35
+  quality_weight: 0.20
+  latency_weight: 0.0
+  latency_threshold_ms: 800
+  # Severity multipliers: critical failures penalized 3x, minor issues 0.5x
+  # severity_multipliers uses defaults: {critical: 3.0, high: 2.0, medium: 1.0, low: 0.5}
+
+autoresearch:
+  eval_scenarios: 35
+  improvement_threshold: 0.005
+  max_experiments: 15
+
+pipeline:
+  attack_rounds: 2
+  verify_rounds: 2
+  scenarios_per_round: 5
+  top_k_elites: 2
+
+conversation:
+  max_turns: 12
+
+llm:
+  model: "claude-sonnet-4-20250514"
+  judge_model: "claude-opus-4-6"
+  researcher_model: "claude-opus-4-6"
+  max_retries: 5
+  timeout: 120
+
+output:
+  dir: "results"
+  save_transcripts: true
+  graphs: true

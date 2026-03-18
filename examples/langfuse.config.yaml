@@ -1,0 +1,48 @@
+# Example config for Langfuse provider (recommended)
+# Single-turn evaluation: reads prompt from Langfuse, tests against Gemini, judges with Claude
+
+provider: langfuse
+
+langfuse:
+  prompt_name: "My Agent Prompt"     # name of your prompt in Langfuse
+  host: "https://cloud.langfuse.com"
+  dataset_prefix: "eval-suite"
+
+gemini:
+  model: "gemini-2.5-flash"          # production model to test against
+  max_tokens: 500
+  temperature: 0.7
+
+assistant:
+  id: "agent-name"
+  name: "My Agent"
+  description: |
+    Describe your agent here. Include:
+    - What it does (booking, support, screening, etc.)
+    - Key behaviors and tone
+    - What it can and cannot do
+    - Known issues from user feedback
+    - Policies and constraints
+
+scoring:
+  should_weight: 0.45
+  should_not_weight: 0.35
+  quality_weight: 0.20
+  latency_weight: 0.0
+
+autoresearch:
+  eval_scenarios: 35                 # scenarios per experiment
+  improvement_threshold: 0.005
+  max_experiments: 15                # 0 = unlimited
+
+llm:
+  model: "claude-sonnet-4-20250514"  # for dataset generation
+  judge_model: "claude-opus-4-6"     # for judging responses (optional, expensive)
+  researcher_model: "claude-opus-4-6" # for proposing changes (optional, expensive)
+  max_retries: 5
+  timeout: 120
+
+output:
+  dir: "results"
+  save_transcripts: true
+  graphs: true

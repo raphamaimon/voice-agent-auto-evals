@@ -1,0 +1,17 @@
+.env
+venv/
+__pycache__/
+*.pyc
+results/
+.DS_Store
+writeup_graphs/
+*.egg-info/
+dist/
+build/
+.mypy_cache/
+.ruff_cache/
+results_vapi/
+results_vapi_20/
+results_*/
+LAUNCH_POST.md
+.claude/
