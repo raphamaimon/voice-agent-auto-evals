@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 from .config import Config
@@ -210,6 +211,46 @@ def _run_eval_suite_single_turn(
     return results
 
 
+def _run_eval_suite_single_turn_parallel(
+    provider,
+    gemini_client,
+    evaluator: Evaluator,
+    cfg: Config,
+    system_prompt: str,
+    eval_suite: list[DatasetItem],
+    max_workers: int = 5,
+) -> list[EvalResult]:
+    """Run eval suite in parallel using ThreadPoolExecutor."""
+    results: list[EvalResult] = []
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        future_to_item = {
+            pool.submit(
+                _eval_single_turn,
+                provider, gemini_client, evaluator, cfg, system_prompt, item,
+            ): item
+            for item in eval_suite
+        }
+        for future in as_completed(future_to_item):
+            try:
+                result = future.result()
+            except Exception as e:
+                item = future_to_item[future]
+                result = EvalResult(
+                    scenario_id=item.id,
+                    persona=item.description or item.category,
+                    score=0.0, csat_score=50, passed=False,
+                    failure_modes=["EVAL_ERROR"],
+                    summary=f"Parallel eval error: {str(e)[:100]}",
+                    weight=item.weight,
+                )
+            display.eval_result_line(result)
+            results.append(result)
+    # Sort by original order
+    id_order = {item.id: i for i, item in enumerate(eval_suite)}
+    results.sort(key=lambda r: id_order.get(r.scenario_id, 999))
+    return results
+
+
 # -------------------------------------------------------------------
 # Shared helpers
 # -------------------------------------------------------------------
@@ -271,6 +312,26 @@ def run(cfg: Config, resume: bool = False) -> None:
     is_single_turn = cfg.provider == "langfuse"
     gemini_client = _build_gemini(cfg) if is_single_turn else None
 
+    # Parallel eval helper
+    use_parallel = is_single_turn and cfg.autoresearch.parallel
+    max_workers = cfg.autoresearch.max_concurrency
+
+    def run_st_eval(prompt, suite):
+        """Run single-turn eval suite (parallel or sequential)."""
+        if use_parallel:
+            return _run_eval_suite_single_turn_parallel(
+                provider, gemini_client, evaluator, cfg,
+                prompt, suite, max_workers=max_workers,
+            )
+        return _run_eval_suite_single_turn(
+            provider, gemini_client, evaluator, cfg, prompt, suite,
+        )
+
+    # Scenario tracking state
+    scenario_scores: dict[str, list[float]] = {}  # sid -> [score_per_experiment]
+    baseline_scores: dict[str, float] = {}         # sid -> baseline score
+    frozen_items: set[str] = set()                  # items excluded from aggregate
+
     # --- Resume or fresh start ---
     prev_state = _load_resume_state(out_dir) if resume else None
 
@@ -298,6 +359,7 @@ def run(cfg: Config, resume: bool = False) -> None:
                 description=exp["description"],
                 prompt_len=exp.get("prompt_len", 0),
                 change_type=exp.get("change_type", ""),
+                target_scenarios=exp.get("target_scenarios", []),
             ))
             if exp["status"] == "keep":
                 best_score = exp["score"]
@@ -305,8 +367,21 @@ def run(cfg: Config, resume: bool = False) -> None:
                     best_prompt = exp["prompt"]
             for r in exp.get("results", []):
                 all_failures.update(r.get("failure_modes", []))
+                sid = r.get("scenario_id", "")
+                if sid:
+                    scenario_scores.setdefault(sid, []).append(r.get("score", 0.0))
             if exp.get("results"):
                 last_eval = [EvalResult.from_dict(r) for r in exp["results"]]
+
+        # Restore baseline scores from first experiment
+        if prev_state["experiments"]:
+            for r in prev_state["experiments"][0].get("results", []):
+                sid = r.get("scenario_id", "")
+                if sid:
+                    baseline_scores[sid] = r.get("score", 0.0)
+
+        # Restore frozen items
+        frozen_items = set(prev_state.get("frozen_items", []))
 
         experiment = history[-1].number if history else 0
 
@@ -318,8 +393,12 @@ def run(cfg: Config, resume: bool = False) -> None:
         display.info(f"Best prompt: {len(best_prompt)} chars")
         display.info(f"Eval suite: {len(eval_suite)} items")
         display.info(f"Failures found: {len(all_failures)}")
+        if frozen_items:
+            display.info(f"Frozen items: {sorted(frozen_items)}")
         if is_single_turn:
             display.info(f"Mode: single-turn (Gemini {cfg.gemini.model})")
+        if use_parallel:
+            display.info(f"Parallel eval: {max_workers} workers")
         if max_experiments:
             display.info(f"Remaining experiments: {max_experiments - experiment}")
 
@@ -341,6 +420,8 @@ def run(cfg: Config, resume: bool = False) -> None:
         display.info(f"Judge model: {cfg.llm.judge_model or cfg.llm.model}")
         display.info(f"Researcher model: {cfg.llm.researcher_model or cfg.llm.model}")
         display.info(f"Eval suite: {n_eval} items")
+        if use_parallel:
+            display.info(f"Parallel eval: {max_workers} workers")
         display.info(f"Threshold: {threshold}")
         if max_experiments:
             display.info(f"Max experiments: {max_experiments}")
@@ -364,6 +445,26 @@ def run(cfg: Config, resume: bool = False) -> None:
             display.info(f"{len(eval_suite)} scenarios generated:")
             display.scenario_list(eval_suite)
 
+        # Validate dataset items
+        display.info("Validating dataset items...")
+        valid_items = []
+        for item in eval_suite:
+            try:
+                check = evaluator.validate_dataset_item(item)
+                if check.get("achievable", True):
+                    valid_items.append(item)
+                else:
+                    display.info(
+                        f"  Dropped {item.id}: {check.get('reason', 'unachievable')[:60]}"
+                    )
+            except Exception:
+                valid_items.append(item)  # keep on validation error
+        if valid_items:
+            eval_suite = valid_items
+            display.info(f"{len(eval_suite)} items passed validation")
+        else:
+            display.info("All items failed validation, keeping original set")
+
         # Upload to Langfuse dataset if applicable
         if hasattr(provider, 'upload_dataset'):
             dataset_name = f"{cfg.langfuse.dataset_prefix}-{datetime.now().strftime('%Y%m%d-%H%M')}"
@@ -382,7 +483,7 @@ def run(cfg: Config, resume: bool = False) -> None:
 
         full_log: dict = {
             "meta": {
-                "version": "autoresearch-2.0",
+                "version": "autoresearch-3.0",
                 "mode": "single-turn" if is_single_turn else "multi-turn",
                 "assistant": cfg.assistant.name or assistant_id,
                 "llm": cfg.llm.model,
@@ -404,10 +505,7 @@ def run(cfg: Config, resume: bool = False) -> None:
         display.blank()
 
         if is_single_turn:
-            baseline_results = _run_eval_suite_single_turn(
-                provider, gemini_client, evaluator, cfg,
-                original_prompt, eval_suite,
-            )
+            baseline_results = run_st_eval(original_prompt, eval_suite)
         else:
             baseline_results = _run_eval_suite(
                 provider, evaluator, cfg, assistant_id, eval_suite,
@@ -418,6 +516,8 @@ def run(cfg: Config, resume: bool = False) -> None:
 
         for r in baseline_results:
             all_failures.update(r.failure_modes)
+            baseline_scores[r.scenario_id] = r.score
+            scenario_scores.setdefault(r.scenario_id, []).append(r.score)
 
         display.blank()
         display.info(
@@ -461,6 +561,7 @@ def run(cfg: Config, resume: bool = False) -> None:
     display.blank()
 
     scoring_formula = cfg.scoring.formula_str()
+    consecutive_skips = 0
 
     try:
         while True:
@@ -478,11 +579,16 @@ def run(cfg: Config, resume: bool = False) -> None:
             proposal = evaluator.propose_prompt_change(
                 best_prompt, last_eval, history,
                 sorted(all_failures), scoring_formula,
+                scenario_scores=scenario_scores,
+                baseline_scores=baseline_scores,
+                frozen_items=frozen_items,
+                scenario_max_attempts=cfg.autoresearch.scenario_max_attempts,
             )
 
             description = proposal.get("description", "unknown")
             change_type = proposal.get("change_type", "?")
             reasoning = proposal.get("reasoning", "")
+            target_scenarios = proposal.get("target_scenarios", [])
             new_prompt = proposal.get("improved_prompt", best_prompt)
 
             display.experiment_proposal(
@@ -492,7 +598,10 @@ def run(cfg: Config, resume: bool = False) -> None:
 
             # Skip if no actual change
             if new_prompt.strip() == best_prompt.strip():
-                display.experiment_skip("no actual change")
+                consecutive_skips += 1
+                display.experiment_skip(
+                    f"no actual change (skip #{consecutive_skips})"
+                )
                 with open(results_path, "a") as f:
                     f.write(
                         f"{experiment}\t{best_score:.6f}\t0.0\t0.000\t"
@@ -503,8 +612,45 @@ def run(cfg: Config, resume: bool = False) -> None:
                     status="skip", description=description,
                     prompt_len=len(new_prompt),
                     change_type=change_type,
+                    target_scenarios=target_scenarios,
                 ))
-                continue
+
+                # After 2 consecutive skips, retry with a forced hint
+                if consecutive_skips >= 2:
+                    display.info("  Retrying with forced diversity hint...")
+                    # Add explicit skip-break instructions
+                    forced_hint = (
+                        "\n\nCRITICAL: Your last {n} proposals produced NO change to the prompt. "
+                        "You are proposing to remove/modify text that does NOT exist in the prompt. "
+                        "READ the prompt carefully between the START/END markers. "
+                        "Make a CONCRETE change: add a new sentence, reword an existing rule, "
+                        "or remove an actual section. The change MUST produce a different prompt."
+                    ).format(n=consecutive_skips)
+                    proposal = evaluator.propose_prompt_change(
+                        best_prompt + forced_hint, last_eval, history,
+                        sorted(all_failures), scoring_formula,
+                        scenario_scores=scenario_scores,
+                        baseline_scores=baseline_scores,
+                        frozen_items=frozen_items,
+                        scenario_max_attempts=cfg.autoresearch.scenario_max_attempts,
+                    )
+                    new_prompt = proposal.get("improved_prompt", best_prompt)
+                    # Strip the forced hint if it leaked into the output
+                    new_prompt = new_prompt.replace(forced_hint, "").strip()
+                    if new_prompt.strip() != best_prompt.strip():
+                        description = proposal.get("description", "unknown")
+                        change_type = proposal.get("change_type", "?")
+                        reasoning = proposal.get("reasoning", "")
+                        target_scenarios = proposal.get("target_scenarios", [])
+                        consecutive_skips = 0
+                        display.info(f"  Retry succeeded: {description[:60]}")
+                        # Fall through to evaluation below
+                    else:
+                        continue  # still a skip, move on
+                else:
+                    continue
+
+            consecutive_skips = 0  # reset on real proposal
 
             # 2. Apply proposed prompt
             if not provider.update_prompt(assistant_id, new_prompt):
@@ -515,20 +661,33 @@ def run(cfg: Config, resume: bool = False) -> None:
             display.blank()
 
             if is_single_turn:
-                eval_results = _run_eval_suite_single_turn(
-                    provider, gemini_client, evaluator, cfg,
-                    new_prompt, eval_suite,
-                )
+                eval_results = run_st_eval(new_prompt, eval_suite)
             else:
                 eval_results = _run_eval_suite(
                     provider, evaluator, cfg, assistant_id, eval_suite,
                 )
 
-            m = aggregate(eval_results)
+            # Track per-scenario scores
+            for r in eval_results:
+                scenario_scores.setdefault(r.scenario_id, []).append(r.score)
+
+            m = aggregate(eval_results, exclude_ids=frozen_items)
             new_score = m.avg_score
 
             for r in eval_results:
                 all_failures.update(r.failure_modes)
+
+            # Auto-drop: freeze items scoring 0.0 in every experiment
+            auto_drop_after = cfg.autoresearch.auto_drop_after
+            if experiment >= auto_drop_after:
+                for sid, scores in scenario_scores.items():
+                    if sid not in frozen_items and len(scores) >= auto_drop_after:
+                        if all(s <= 0.05 for s in scores):
+                            frozen_items.add(sid)
+                            display.info(
+                                f"  Froze {sid} (scored ≤0.05 in all "
+                                f"{len(scores)} experiments)"
+                            )
 
             # 4. Keep or revert
             delta = new_score - best_score
@@ -567,6 +726,7 @@ def run(cfg: Config, resume: bool = False) -> None:
                 number=experiment, score=new_score, status=status,
                 description=description, prompt_len=len(new_prompt),
                 change_type=change_type,
+                target_scenarios=target_scenarios,
             ))
 
             full_log["experiments"].append({
@@ -574,6 +734,7 @@ def run(cfg: Config, resume: bool = False) -> None:
                 "timestamp": datetime.now().isoformat(),
                 "description": description,
                 "change_type": change_type,
+                "target_scenarios": target_scenarios,
                 "reasoning": reasoning,
                 "prompt_len": len(new_prompt),
                 "score": new_score,
@@ -585,6 +746,7 @@ def run(cfg: Config, resume: bool = False) -> None:
                 "results": eval_results,
                 "prompt": new_prompt if status == "keep" else None,
             })
+            full_log["frozen_items"] = sorted(frozen_items)
 
             # Save after every experiment (crash-safe)
             _save_log(full_log, out_dir)

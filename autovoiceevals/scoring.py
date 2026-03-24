@@ -63,32 +63,40 @@ def composite_score(
     if multiplier != 1.0 and composite < 1.0:
         failure_portion = 1.0 - composite
         composite = 1.0 - (failure_portion * multiplier)
-        composite = max(0.0, composite)
+        composite = max(weights.min_scenario_score, composite)
 
     return composite, s_score, sn_score, quality_score
 
 
-def aggregate(results: list[EvalResult]) -> Metrics:
+def aggregate(
+    results: list[EvalResult],
+    exclude_ids: set[str] | None = None,
+) -> Metrics:
     """Aggregate per-scenario eval results into summary metrics.
 
     Uses per-scenario weights when available (default 1.0).
+    Items in exclude_ids are skipped for scoring but still counted for failure tracking.
     """
     if not results:
         return Metrics(0.0, 0.0, 0.0, 0, 0)
 
-    total_weight = sum(r.weight for r in results)
-    avg_score = sum(r.score * r.weight for r in results) / total_weight
-    avg_csat = sum(r.csat_score * r.weight for r in results) / total_weight
-    n_passed = sum(1 for r in results if r.passed)
+    active = [r for r in results if not exclude_ids or r.scenario_id not in exclude_ids]
+    if not active:
+        active = results  # fallback: don't exclude everything
+
+    total_weight = sum(r.weight for r in active)
+    avg_score = sum(r.score * r.weight for r in active) / total_weight
+    avg_csat = sum(r.csat_score * r.weight for r in active) / total_weight
+    n_passed = sum(1 for r in active if r.passed)
     failures: set[str] = set()
-    for r in results:
+    for r in results:  # track failures from ALL items, including frozen
         failures.update(r.failure_modes)
 
     return Metrics(
         avg_score=avg_score,
         avg_csat=avg_csat,
-        pass_rate=n_passed / len(results),
+        pass_rate=n_passed / len(active),
         n_passed=n_passed,
-        n_total=len(results),
+        n_total=len(active),
         unique_failures=sorted(failures),
     )

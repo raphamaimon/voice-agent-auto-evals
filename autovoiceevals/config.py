@@ -35,11 +35,12 @@ class ScoringConfig:
     latency_weight: float = 0.15
     latency_threshold_ms: float = 3000.0
     severity_multipliers: dict = None  # type: ignore[assignment]
+    min_scenario_score: float = 0.05   # floor to prevent 0.0 items distorting aggregate
 
     def __post_init__(self):
         if self.severity_multipliers is None:
             self.severity_multipliers = {
-                "critical": 3.0, "high": 2.0, "medium": 1.0, "low": 0.5,
+                "critical": 2.0, "high": 1.5, "medium": 1.0, "low": 0.75,
             }
 
     def formula_str(self) -> str:
@@ -61,6 +62,10 @@ class AutoresearchConfig:
     eval_scenarios: int = 8
     improvement_threshold: float = 0.005
     max_experiments: int = 0       # 0 = unlimited
+    scenario_max_attempts: int = 3  # blacklist scenario after N failed targeting attempts
+    parallel: bool = True           # parallel eval suite execution
+    max_concurrency: int = 5        # max parallel workers
+    auto_drop_after: int = 3        # freeze items scoring 0.0 after N experiments
 
 
 @dataclass
@@ -188,6 +193,7 @@ def load_config(path: str | None = None) -> Config:
         latency_weight=sc.get("latency_weight", 0.15),
         latency_threshold_ms=sc.get("latency_threshold_ms", 3000.0),
         severity_multipliers=sc.get("severity_multipliers", None),
+        min_scenario_score=sc.get("min_scenario_score", 0.05),
     )
     weight_sum = (scoring.should_weight + scoring.should_not_weight
                   + scoring.quality_weight + scoring.latency_weight)
@@ -218,6 +224,10 @@ def load_config(path: str | None = None) -> Config:
             eval_scenarios=ar.get("eval_scenarios", 8),
             improvement_threshold=ar.get("improvement_threshold", 0.005),
             max_experiments=ar.get("max_experiments", 0),
+            scenario_max_attempts=ar.get("scenario_max_attempts", 3),
+            parallel=ar.get("parallel", True),
+            max_concurrency=ar.get("max_concurrency", 5),
+            auto_drop_after=ar.get("auto_drop_after", 3),
         ),
         pipeline=PipelineConfig(
             attack_rounds=pl.get("attack_rounds", 2),

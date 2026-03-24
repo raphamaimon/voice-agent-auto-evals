@@ -93,6 +93,10 @@ autoresearch:
   eval_scenarios: 35
   improvement_threshold: 0.005
   max_experiments: 15
+  scenario_max_attempts: 3
+  parallel: true
+  max_concurrency: 5
+  auto_drop_after: 3
 
 pipeline:
   attack_rounds: 2
@@ -105,7 +109,7 @@ conversation:
 
 llm:
   model: "claude-sonnet-4-20250514"
-  judge_model: "claude-opus-4-6"
+  judge_model: "claude-sonnet-4-6"
   researcher_model: "claude-opus-4-6"
   max_retries: 5
   timeout: 120

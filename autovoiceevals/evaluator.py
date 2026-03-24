@@ -319,6 +319,12 @@ KNOWN ISSUES TO TEST (category "known_issues"):
 - Caller interrupts mid-sentence (context ends with partial assistant turn + caller cutting in)
 - Agent screens a caller who explicitly identifies as family/saved contact
 
+CRITICAL RULE FOR "known_issues" ASSISTANT TURNS:
+For known_issues items, the assistant turns in conversation_context must be GOOD/NATURAL
+responses. The test is whether the agent's NEXT response (the one being evaluated) avoids
+the known issue. Do NOT make the assistant turns in the context robotic or buggy — that
+would prime the production model to continue in that same bad pattern, which is not a fair test.
+
 BREVITY TESTS (category "brevity_test"):
 - Simple scenarios where the ideal response is very short (under 15 words)
 - agent_should MUST include "respond concisely (under 15 words)"
@@ -360,6 +366,45 @@ T01-T{n_brevity:02d} for brevity_test."""
         if isinstance(result, list):
             return [DatasetItem.from_dict(item) for item in result[:num]]
         return []
+
+    # ---------------------------------------------------------------
+    # Dataset validation
+    # ---------------------------------------------------------------
+
+    def validate_dataset_item(self, item: DatasetItem) -> dict:
+        """Check if a dataset item's criteria are jointly satisfiable.
+
+        Returns dict with "achievable" (bool) and "reason" (str).
+        Uses default model (Sonnet) for cost efficiency.
+        """
+        context_str = "\n".join(
+            f"{'CALLER' if m['role'] == 'user' else 'AGENT'}: {m['content']}"
+            for m in item.conversation_context
+        )
+
+        prompt = f"""Evaluate whether these evaluation criteria are jointly satisfiable.
+
+CONVERSATION CONTEXT:
+{context_str}
+
+The agent must produce ONE response after this context.
+
+agent_should: {json.dumps(item.agent_should)}
+agent_should_not: {json.dumps(item.agent_should_not)}
+
+Can a reasonable AI agent satisfy ALL agent_should criteria WITHOUT violating ANY agent_should_not criteria?
+
+Return JSON:
+{{"achievable": true/false, "reason": "brief explanation"}}"""
+
+        result = self.llm.call_json(
+            "You are a QA validation expert. Assess whether evaluation criteria are achievable. "
+            "Return valid JSON only.",
+            prompt, max_tokens=300,
+        )
+        if isinstance(result, dict):
+            return result
+        return {"achievable": True, "reason": "validation parse error"}
 
     # ---------------------------------------------------------------
     # Scenario mutation
@@ -576,36 +621,43 @@ Return JSON:
         history: list[ExperimentRecord],
         known_failures: list[str],
         scoring_formula: str,
+        scenario_scores: dict[str, list[float]] | None = None,
+        baseline_scores: dict[str, float] | None = None,
+        frozen_items: set[str] | None = None,
+        scenario_max_attempts: int = 3,
     ) -> dict:
         """Propose ONE surgical change to the system prompt.
 
         Uses researcher_model (Opus) for deeper reasoning.
-        Includes exploration diversity rules and hypothesis-driven structure.
+        Includes exploration diversity rules, scenario-aware targeting,
+        and hypothesis-driven structure.
 
         Returns dict with "description", "reasoning", "change_type",
-        and "improved_prompt".
+        "target_scenarios", and "improved_prompt".
         """
-        # Build concise history with change_type
+        # Build concise history with change_type and target scenarios
         history_ctx = ""
         if history:
-            lines = [
-                f"  exp {h.number:2d} [{h.status:7s}] {h.change_type or '?':8s} "
-                f"score={h.score:.3f} len={h.prompt_len} | "
-                f"{h.description[:65]}"
-                for h in history[-15:]
-            ]
+            lines = []
+            for h in history[-15:]:
+                targets = ",".join(h.target_scenarios[:3]) if h.target_scenarios else "?"
+                lines.append(
+                    f"  exp {h.number:2d} [{h.status:7s}] {h.change_type or '?':8s} "
+                    f"targets={targets:12s} score={h.score:.3f} len={h.prompt_len} | "
+                    f"{h.description[:55]}"
+                )
             history_ctx = (
                 "\nEXPERIMENT HISTORY (recent):\n" + "\n".join(lines) + "\n"
             )
 
-        # Exploration diversity: count change_type failures since last success
+        # --- Change-type diversity (existing) ---
         type_failures: dict[str, int] = {}
         for h in reversed(history):
             if h.status == "discard":
                 ct = h.change_type or "unknown"
                 type_failures[ct] = type_failures.get(ct, 0) + 1
             elif h.status == "keep":
-                break  # only count since last kept experiment
+                break
 
         diversity_rules = ""
         type_warnings = []
@@ -622,7 +674,7 @@ Return JSON:
                 break
 
         if type_warnings or consecutive_discards >= 4:
-            diversity_rules = "\nEXPLORATION DIVERSITY RULES:\n"
+            diversity_rules = "\nCHANGE-TYPE DIVERSITY RULES:\n"
             if type_warnings:
                 diversity_rules += "\n".join(type_warnings) + "\n"
             if consecutive_discards >= 4:
@@ -637,6 +689,76 @@ Return JSON:
                     "Prefer 'remove' experiments to simplify.\n"
                 )
 
+        # --- Scenario-level diversity (NEW) ---
+        scenario_attempts: dict[str, int] = {}
+        for h in reversed(history):
+            if h.status == "discard":
+                for sid in h.target_scenarios:
+                    scenario_attempts[sid] = scenario_attempts.get(sid, 0) + 1
+            elif h.status == "keep":
+                break
+
+        blacklisted_scenarios = {
+            sid for sid, count in scenario_attempts.items()
+            if count >= scenario_max_attempts
+        }
+
+        # Find failing but untargeted scenarios
+        failing_untargeted = []
+        if eval_results:
+            all_targeted = set()
+            for h in history:
+                all_targeted.update(h.target_scenarios)
+            for r in sorted(eval_results, key=lambda x: x.score):
+                if not r.passed and r.scenario_id not in all_targeted:
+                    failing_untargeted.append(
+                        f"  {r.scenario_id}: score={r.score:.3f} | {r.persona[:40]}"
+                    )
+
+        scenario_diversity = ""
+        if blacklisted_scenarios or failing_untargeted:
+            scenario_diversity = "\nSCENARIO TARGETING RULES:\n"
+            if blacklisted_scenarios:
+                for sid in sorted(blacklisted_scenarios):
+                    n = scenario_attempts[sid]
+                    scenario_diversity += (
+                        f"  - Scenario {sid} targeted {n}x without success — "
+                        "DO NOT target this scenario again\n"
+                    )
+            if failing_untargeted:
+                scenario_diversity += (
+                    "  FAILING BUT UNTRIED scenarios (focus here instead):\n"
+                    + "\n".join(failing_untargeted[:8]) + "\n"
+                )
+
+        # --- Scenario improvement matrix (NEW) ---
+        matrix_ctx = ""
+        if scenario_scores and baseline_scores:
+            lines = []
+            frozen = frozen_items or set()
+            for sid in sorted(scenario_scores.keys()):
+                scores = scenario_scores[sid]
+                bl = baseline_scores.get(sid, 0.0)
+                current = scores[-1] if scores else bl
+                best_ever = max(scores) if scores else bl
+                # Count how many times targeted
+                n_targeted = scenario_attempts.get(sid, 0)
+                # Trend
+                if current > bl + 0.05:
+                    trend = "improved"
+                elif current < bl - 0.05:
+                    trend = "REGRESSED"
+                else:
+                    trend = "flat"
+                frozen_tag = " [FROZEN]" if sid in frozen else ""
+                bl_tag = " [BLACKLISTED]" if sid in blacklisted_scenarios else ""
+                lines.append(
+                    f"  {sid}: baseline={bl:.2f} current={current:.2f} "
+                    f"best={best_ever:.2f} trend={trend} "
+                    f"(targeted {n_targeted}x){frozen_tag}{bl_tag}"
+                )
+            matrix_ctx = "\nSCENARIO IMPROVEMENT MATRIX:\n" + "\n".join(lines) + "\n"
+
         # Build failure context from latest eval with quality scores
         failure_ctx = ""
         if eval_results:
@@ -649,21 +771,28 @@ Return JSON:
                     tone = q.get("tone", {}).get("tone_detected", "?")
                     quality_info = f" quality={brevity}/10 tone={tone}"
                 lines.append(
-                    f"  [{'PASS' if r.passed else 'FAIL'}] {r.score:.3f}{quality_info} | "
-                    f"{r.persona[:30]} | {r.summary[:70]}"
+                    f"  [{'PASS' if r.passed else 'FAIL'}] {r.scenario_id} {r.score:.3f}"
+                    f"{quality_info} | {r.persona[:30]} | {r.summary[:60]}"
                 )
             failure_ctx = (
                 "\nLATEST EVAL RESULTS:\n" + "\n".join(lines) + "\n"
             )
 
-        # Worst response for detailed analysis (single-turn or multi-turn)
+        # Worst response: prefer untargeted failing scenario over overall worst
         worst_detail = ""
         if eval_results:
-            worst = min(eval_results, key=lambda x: x.score)
+            # Find worst untargeted scenario
+            untargeted_failures = [
+                r for r in eval_results
+                if not r.passed and r.scenario_id not in blacklisted_scenarios
+            ]
+            candidates = untargeted_failures if untargeted_failures else eval_results
+            worst = min(candidates, key=lambda x: x.score)
             if not worst.passed:
                 content = worst.agent_response or worst.transcript
                 worst_detail = (
-                    f"\nWORST RESPONSE ({worst.persona}, score={worst.score:.3f}):\n"
+                    f"\nWORST UNTARGETED RESPONSE ({worst.scenario_id}, "
+                    f"{worst.persona}, score={worst.score:.3f}):\n"
                     f"{content[:1000]}\n"
                 )
 
@@ -671,16 +800,19 @@ Return JSON:
         failures_summary = ""
         if known_failures:
             failures_summary = (
-                "\nAREAS WHERE THE AGENT HAS STRUGGLED:\n"
+                "\n[ANALYSIS] Recurring failure tags from evaluations:\n"
                 + "\n".join(f"  - {f.replace('_', ' ').lower()}" for f in known_failures[:15])
                 + "\n"
             )
 
         prompt = f"""Propose ONE specific change to this voice agent's system prompt.
 
-CURRENT PROMPT ({len(current_prompt)} chars):
+===== START OF CURRENT PROMPT (this is the ONLY text you can edit) =====
 {current_prompt}
-{failures_summary}{history_ctx}{diversity_rules}{failure_ctx}{worst_detail}
+===== END OF CURRENT PROMPT =====
+
+Everything below is ANALYSIS CONTEXT — do NOT copy any of it into improved_prompt.
+{failures_summary}{history_ctx}{diversity_rules}{scenario_diversity}{matrix_ctx}{failure_ctx}{worst_detail}
 Your goal: MAXIMIZE the average composite score across the eval suite.
 The score is: {scoring_formula}
 
@@ -690,20 +822,25 @@ MANDATORY STRUCTURE for your proposal:
 3. INTERVENTION: What exact change addresses the root cause?
 4. RISK: Which passing scenarios might regress?
 
-IMPORTANT CONSTRAINTS on improved_prompt:
-- It must ONLY contain natural instructions for the voice agent.
-- Do NOT append failure mode lists, scoring info, eval metadata, or any
-  text from this analysis prompt into the agent's instructions.
-- The prompt should read as natural instructions to a phone assistant.
-- A human reading the prompt should not see any testing/evaluation artifacts.
+CRITICAL CONSTRAINTS on improved_prompt:
+- Your improved_prompt must contain ONLY the text between the START/END markers above,
+  with your ONE change applied. Nothing else.
+- Do NOT copy ANY text from the ANALYSIS CONTEXT section into improved_prompt.
+- Do NOT include failure tags, scoring info, scenario IDs, experiment history,
+  or any evaluation metadata in the prompt.
+- The prompt must read as natural instructions to a phone assistant.
+- If your change is "remove", the improved_prompt should be SHORTER than the current prompt.
 
 Return JSON:
 {{
   "description": "1-sentence description of the change",
   "reasoning": "Hypothesis + evidence + why this intervention addresses the root cause",
   "change_type": "add|modify|remove|reorder",
+  "target_scenarios": ["ID1", "ID2"],
   "improved_prompt": "the COMPLETE prompt with your ONE change applied"
-}}"""
+}}
+
+target_scenarios: list the 1-3 scenario IDs this change is primarily trying to improve."""
 
         result = self.llm.call_json(
             RESEARCHER_SYSTEM, prompt, max_tokens=6000,
@@ -716,5 +853,6 @@ Return JSON:
             "description": "no change proposed",
             "reasoning": "",
             "change_type": "none",
+            "target_scenarios": [],
             "improved_prompt": current_prompt,
         }

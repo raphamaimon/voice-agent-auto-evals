@@ -207,3 +207,4 @@ class ExperimentRecord:
     description: str
     prompt_len: int = 0
     change_type: str = ""  # "add" | "modify" | "remove" | "reorder"
+    target_scenarios: list[str] = field(default_factory=list)  # scenario IDs this experiment targeted
