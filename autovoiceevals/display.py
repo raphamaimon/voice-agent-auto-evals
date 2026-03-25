@@ -6,6 +6,7 @@ never call print() directly — they call functions here instead.
 
 from __future__ import annotations
 
+import sys
 from .models import DatasetItem, EvalResult, ExperimentRecord, Metrics, Scenario
 
 
@@ -16,22 +17,22 @@ from .models import DatasetItem, EvalResult, ExperimentRecord, Metrics, Scenario
 def header(title: str, width: int = 70) -> None:
     print(f"\n{'=' * width}")
     print(f"  {title}")
-    print(f"{'=' * width}")
+    print(f"{'=' * width}", flush=True)
 
 
 def section(title: str, width: int = 70) -> None:
     line = "\u2501" * width
     print(f"\n{line}")
     print(f"  {title}")
-    print(line)
+    print(line, flush=True)
 
 
 def info(msg: str) -> None:
-    print(f"  {msg}")
+    print(f"  {msg}", flush=True)
 
 
 def blank() -> None:
-    print()
+    print(flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -46,7 +47,8 @@ def eval_result_line(result: EvalResult) -> None:
     label = result.persona[:40] if result.persona else result.scenario_id
     print(
         f"    [{p}] {result.score:.3f} [{bar}] "
-        f"CSAT={result.csat_score} {label}"
+        f"CSAT={result.csat_score} {label}",
+        flush=True,
     )
 
 

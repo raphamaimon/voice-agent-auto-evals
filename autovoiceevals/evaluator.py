@@ -113,6 +113,32 @@ IMPROVER_SYSTEM = (
     "You MUST respond with valid JSON only."
 )
 
+COMPRESSOR_SYSTEM = (
+    "You are an expert voice AI prompt compressor.\n"
+    "Your SOLE goal: make the prompt SHORTER while preserving behavior.\n\n"
+    "You are a world expert in production voice agent prompts. You know that:\n"
+    "- Long prompts increase TTFT (time-to-first-token) latency, critical in voice\n"
+    "- Instruction dilution: overly long prompts cause the model to deprioritize rules\n"
+    "- The ideal production voice prompt is 1000-1200 words (~1500-1800 tokens)\n"
+    "- Concise, imperative language is more effective than verbose explanations\n\n"
+    "COMPRESSION TECHNIQUES (use these):\n"
+    "1. MERGE redundant rules — if two rules say similar things, combine into one\n"
+    "2. REMOVE low-value text — examples that don't add clarity, obvious instructions\n"
+    "3. SHORTEN verbose rules — 'You should always make sure to...' → 'Always...'\n"
+    "4. USE LISTS — replace paragraphs with bullet points\n"
+    "5. REMOVE filler words — 'Please note that', 'It is important to', 'Make sure to'\n"
+    "6. CONSOLIDATE sections — merge sections with overlapping themes\n"
+    "7. REMOVE META-INSTRUCTIONS — remove instructions about how to read the prompt itself\n\n"
+    "CRITICAL CONSTRAINTS:\n"
+    "- NEVER remove security rules (identity protection, fraud detection)\n"
+    "- NEVER remove core behavioral rules that directly affect pass/fail criteria\n"
+    "- ALWAYS preserve the agent's personality and tone instructions\n"
+    "- Each compression should remove 10-25% of prompt length (NOT more — be incremental)\n"
+    "- Do NOT try to compress the entire prompt at once — pick ONE section to compress\n"
+    "- Test ONE compression technique per experiment\n\n"
+    "You MUST respond with valid JSON only."
+)
+
 RESEARCHER_SYSTEM = (
     "You are an autonomous voice AI prompt researcher.\n"
     "You optimize a voice agent's system prompt through iterative "
@@ -854,5 +880,132 @@ target_scenarios: list the 1-3 scenario IDs this change is primarily trying to i
             "reasoning": "",
             "change_type": "none",
             "target_scenarios": [],
+            "improved_prompt": current_prompt,
+        }
+
+    # ---------------------------------------------------------------
+    # Prompt compression proposal (compress mode)
+    # ---------------------------------------------------------------
+
+    def propose_prompt_compression(
+        self,
+        current_prompt: str,
+        eval_results: list[EvalResult],
+        history: list[ExperimentRecord],
+        baseline_score: float,
+        target_words: int = 1200,
+        score_floor: float = 0.0,
+        extra_constraint: str = "",
+    ) -> dict:
+        """Propose ONE compression to shorten the prompt while preserving score.
+
+        Uses researcher_model (Opus) for careful analysis.
+        Focuses purely on making the prompt shorter.
+
+        Returns dict with "description", "reasoning", "technique",
+        "words_removed", and "improved_prompt".
+        """
+        current_words = len(current_prompt.split())
+
+        # Build compression history
+        history_ctx = ""
+        if history:
+            lines = []
+            for h in history[-15:]:
+                lines.append(
+                    f"  exp {h.number:2d} [{h.status:7s}] "
+                    f"score={h.score:.3f} len={h.prompt_len} words~{h.prompt_len // 6} | "
+                    f"{h.description[:60]}"
+                )
+            history_ctx = (
+                "\nCOMPRESSION HISTORY:\n" + "\n".join(lines) + "\n"
+            )
+
+        # Find regressions from compression attempts
+        regression_warnings = ""
+        if history:
+            regressed = [
+                h for h in history
+                if h.status == "discard" and h.score < baseline_score - 0.02
+            ]
+            if regressed:
+                regression_warnings = "\nPREVIOUS REGRESSIONS (avoid these patterns):\n"
+                for h in regressed[-5:]:
+                    regression_warnings += (
+                        f"  - {h.description[:60]} → score dropped to {h.score:.3f}\n"
+                    )
+
+        # Show eval results summary
+        failure_ctx = ""
+        if eval_results:
+            failing = [r for r in eval_results if not r.passed]
+            passing = [r for r in eval_results if r.passed]
+            failure_ctx = (
+                f"\nCURRENT EVAL: {len(passing)} pass, {len(failing)} fail\n"
+            )
+            if failing:
+                failure_ctx += "  Failing scenarios (DO NOT make these worse):\n"
+                for r in sorted(failing, key=lambda x: x.score):
+                    failure_ctx += f"    {r.scenario_id}: {r.score:.3f} | {r.persona[:40]}\n"
+
+        # Consecutive discard detection
+        consecutive_discards = 0
+        for h in reversed(history):
+            if h.status == "discard":
+                consecutive_discards += 1
+            else:
+                break
+
+        urgency = ""
+        if consecutive_discards >= 3:
+            urgency = (
+                f"\n⚠ {consecutive_discards} consecutive failed compressions. "
+                "Try a DIFFERENT technique. Consider:\n"
+                "- Merging two sections instead of removing one\n"
+                "- Shortening verbose sentences rather than removing rules\n"
+                "- Removing examples/lists that are obvious\n"
+            )
+
+        prompt = f"""Compress this voice agent system prompt to make it shorter.
+
+===== START OF CURRENT PROMPT ({current_words} words) =====
+{current_prompt}
+===== END OF CURRENT PROMPT =====
+
+THIS STEP TARGET: Remove 100-200 words from the prompt (currently {current_words} words → aim for {max(current_words - 200, target_words)}-{max(current_words - 100, target_words)} words).
+FINAL GOAL: Eventually reach ~{target_words} words across multiple steps.
+SCORE FLOOR: Current score is {baseline_score:.3f}. Must stay above {score_floor:.3f} after compression.
+{history_ctx}{regression_warnings}{failure_ctx}{urgency}
+RULES:
+1. Remove or shorten ONE section/rule per experiment — NOT multiple sections
+2. Remove between 100 and {int(current_words * 0.20)} words ONLY. Output must have {current_words - int(current_words * 0.20)}-{current_words - 100} words.
+3. Do NOT remove security rules or fraud detection
+4. Do NOT rewrite the entire prompt — pick ONE section to compress
+5. Preserve the agent's personality and core behavior
+6. Use concise, imperative language
+7. If a rule is already covered by another rule, remove the duplicate
+8. CRITICAL: Keep the overall structure intact — only compress, don't reorganize everything
+{extra_constraint}
+Return JSON:
+{{
+  "description": "1-sentence description of what was compressed",
+  "reasoning": "Why this text can be safely removed/shortened without affecting behavior",
+  "technique": "merge|remove|shorten|consolidate",
+  "words_removed": <estimated number>,
+  "improved_prompt": "the COMPLETE compressed prompt"
+}}"""
+
+        result = self.llm.call_json(
+            COMPRESSOR_SYSTEM, prompt, max_tokens=8000,
+            model=self.researcher_model,
+        )
+        if isinstance(result, dict) and "improved_prompt" in result:
+            result["improved_prompt"] = _sanitize_prompt(result["improved_prompt"])
+            return result
+        return {
+            "description": "no compression proposed",
+            "reasoning": "",
+            "technique": "none",
+            "words_removed": 0,
             "improved_prompt": current_prompt,
         }

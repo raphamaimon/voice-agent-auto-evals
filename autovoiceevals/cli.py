@@ -54,6 +54,36 @@ def main() -> None:
         help="Path to config YAML (default: config.yaml)",
     )
 
+    # --- compress subcommand ---
+    cmp = sub.add_parser(
+        "compress",
+        help="Shorten prompt while preserving score",
+        description=(
+            "Iteratively compress the system prompt to reduce latency. "
+            "Keeps compressions that maintain score above a configurable floor."
+        ),
+    )
+    cmp.add_argument(
+        "--config", "-c", default="config.yaml",
+        help="Path to config YAML (default: config.yaml)",
+    )
+    cmp.add_argument(
+        "--target-words", type=int, default=1200,
+        help="Target word count (default: 1200)",
+    )
+    cmp.add_argument(
+        "--max-regression", type=float, default=0.03,
+        help="Max allowed score drop from baseline (default: 0.03 = 3%%)",
+    )
+    cmp.add_argument(
+        "--min-score", type=float, default=0.0,
+        help="Absolute minimum score floor (default: 0.0, e.g., 0.80 for 80%%)",
+    )
+    cmp.add_argument(
+        "--eval-suite", type=str, default="",
+        help="Path to autoresearch.json to reuse its eval suite for comparable scores",
+    )
+
     # --- results subcommand ---
     rsl = sub.add_parser(
         "results",
@@ -91,6 +121,10 @@ def main() -> None:
     if args.mode == "research":
         from .researcher import run
         run(cfg, resume=args.resume)
+    elif args.mode == "compress":
+        from .compress import run
+        run(cfg, target_words=args.target_words, max_regression=args.max_regression,
+            min_score=args.min_score, eval_suite_path=args.eval_suite)
     elif args.mode == "pipeline":
         from .pipeline import run
         run(cfg)
